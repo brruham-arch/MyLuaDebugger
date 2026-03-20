@@ -141,6 +141,16 @@ void LuaDebugger_hook(lua_State* L, lua_Debug* ar) {
     // Skip kalau tidak ada nama fungsi
     if (!ar->name) return;
 
+    // Hanya track global & C API — skip local/upvalue/field/method
+    if (ar->namewhat) {
+        if (strcmp(ar->namewhat, "local")   == 0) return;
+        if (strcmp(ar->namewhat, "upvalue") == 0) return;
+        if (strcmp(ar->namewhat, "field")   == 0) return;
+        if (strcmp(ar->namewhat, "method")  == 0) return;
+    }
+    // Skip nama <= 2 karakter (obfuscated local)
+    if (strlen(ar->name) <= 2) return;
+
     // Kita track semua fungsi, tapi caller harus dari user script
     // Cari dari mana fungsi ini dipanggil
     char caller_script[SCRIPT_LEN] = {0};
