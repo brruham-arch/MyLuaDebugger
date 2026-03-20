@@ -20,75 +20,39 @@ static void onLoad() {
     LOGI("LuaDebugger loaded!");
     writeLog("[LuaDebugger] .so loaded successfully");
 
-    // Step 2: coba beberapa nama kandidat libmonetloader
-    const char* candidates[] = {
-        "libmonetloader.so",
-        "libMoNetLoader.so",
-        "libmonet.so",
-        "libmoonloader.so",
-        NULL
-    };
-
-    void* monetHandle = NULL;
-    const char* loadedName = NULL;
-
-    for (int i = 0; candidates[i] != NULL; i++) {
-        // coba RTLD_NOLOAD dulu (kalau sudah di-load sebelumnya)
-        monetHandle = dlopen(candidates[i], RTLD_NOLOAD | RTLD_GLOBAL);
-        if (!monetHandle) {
-            // kalau belum ada, load sendiri
-            monetHandle = dlopen(candidates[i], RTLD_NOW | RTLD_GLOBAL);
-        }
-        if (monetHandle) {
-            loadedName = candidates[i];
-            break;
-        }
+    // Step 2: dlopen libmonetloader.so
+    void* monetHandle = dlopen("libmonetloader.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!monetHandle) {
+        writeLog("[Step2] dlopen libmonetloader.so FAILED");
+        return;
     }
+    writeLog("[Step2] dlopen libmonetloader.so SUCCESS");
 
-    if (monetHandle && loadedName) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "[Step2] dlopen SUCCESS: %s", loadedName);
-        writeLog(buf);
-        LOGI("dlopen SUCCESS: %s", loadedName);
+    // Step 3: dlopen libluajit, dapat function pointers penting
+    void* luajitHandle = dlopen("libluajit-5.1.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!luajitHandle) {
+        writeLog("[Step3] dlopen libluajit-5.1.so FAILED");
+        return;
+    }
+    writeLog("[Step3] dlopen libluajit-5.1.so SUCCESS");
 
-        // Step 3: cari lua_State* via dlsym
-        const char* symCandidates[] = {
-            "g_LuaState",
-            "gLuaState",
-            "luaState",
-            "L",
-            "gL",
-            "lua_state",
-            "monetLuaState",
-            NULL
-        };
+    void* fn_sethook = dlsym(luajitHandle, "lua_sethook");
+    void* fn_getinfo = dlsym(luajitHandle, "lua_getinfo");
+    void* fn_pcall   = dlsym(luajitHandle, "lua_pcall");
 
-        void* symAddr = NULL;
-        const char* foundSym = NULL;
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "[Step3] lua_sethook=0x%x lua_getinfo=0x%x lua_pcall=0x%x",
+        (unsigned int)fn_sethook,
+        (unsigned int)fn_getinfo,
+        (unsigned int)fn_pcall
+    );
+    writeLog(buf);
+    LOGI("%s", buf);
 
-        for (int i = 0; symCandidates[i] != NULL; i++) {
-            symAddr = dlsym(monetHandle, symCandidates[i]);
-            if (symAddr) {
-                foundSym = symCandidates[i];
-                break;
-            }
-        }
-
-        if (symAddr && foundSym) {
-            char buf2[256];
-            snprintf(buf2, sizeof(buf2), "[Step3] lua_State* found via symbol: '%s' addr=0x%x", foundSym, (unsigned int)symAddr);
-            writeLog(buf2);
-            LOGI("%s", buf2);
-        } else {
-            writeLog("[Step3] dlsym FAILED: tidak ada symbol yang cocok, perlu offset manual");
-            LOGI("dlsym FAILED: tidak ada symbol yang cocok");
-        }
-
+    if (fn_sethook && fn_getinfo && fn_pcall) {
+        writeLog("[Step3] Semua function pointer OK -> siap Step 4 (hook lua_pcall untuk capture lua_State*)");
     } else {
-        const char* err = dlerror();
-        char buf[256];
-        snprintf(buf, sizeof(buf), "[Step2] dlopen FAILED semua kandidat: %s", err ? err : "unknown");
-        writeLog(buf);
-        LOGI("dlopen FAILED: %s", err ? err : "unknown");
+        writeLog("[Step3] Ada function pointer NULL, cek hasil di atas");
     }
 }
