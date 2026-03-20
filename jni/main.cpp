@@ -258,11 +258,15 @@ void LuaDebugger_hook(lua_State* L, lua_Debug* ar) {
     jsonEscape(src, srcEsc, sizeof(srcEsc));
     jsonEscape(ar->name ? ar->name : "(anon)", nameEsc, sizeof(nameEsc));
 
-    // Argumen hanya untuk CALL event
-    if (ar->event == 0) getArgs(L, args, sizeof(args));
-
-    // Stack trace
-    getStackTrace(L, stack, sizeof(stack));
+    // Argumen dan stack trace hanya untuk CALL dan RETURN
+    // LINE event skip keduanya — terlalu berat
+    if (ar->event == 0) {
+        getArgs(L, args, sizeof(args));
+        getStackTrace(L, stack, sizeof(stack));
+    } else if (ar->event == 1) {
+        getStackTrace(L, stack, sizeof(stack));
+    }
+    // event == 2 (line): args dan stack tetap "[]"
 
     char json[JSON_LINE_LEN];
     snprintf(json, sizeof(json),
