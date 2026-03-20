@@ -50,6 +50,40 @@ static void onLoad() {
         snprintf(buf, sizeof(buf), "[Step2] dlopen SUCCESS: %s", loadedName);
         writeLog(buf);
         LOGI("dlopen SUCCESS: %s", loadedName);
+
+        // Step 3: cari lua_State* via dlsym
+        const char* symCandidates[] = {
+            "g_LuaState",
+            "gLuaState",
+            "luaState",
+            "L",
+            "gL",
+            "lua_state",
+            "monetLuaState",
+            NULL
+        };
+
+        void* symAddr = NULL;
+        const char* foundSym = NULL;
+
+        for (int i = 0; symCandidates[i] != NULL; i++) {
+            symAddr = dlsym(monetHandle, symCandidates[i]);
+            if (symAddr) {
+                foundSym = symCandidates[i];
+                break;
+            }
+        }
+
+        if (symAddr && foundSym) {
+            char buf2[256];
+            snprintf(buf2, sizeof(buf2), "[Step3] lua_State* found via symbol: '%s' addr=0x%x", foundSym, (unsigned int)symAddr);
+            writeLog(buf2);
+            LOGI("%s", buf2);
+        } else {
+            writeLog("[Step3] dlsym FAILED: tidak ada symbol yang cocok, perlu offset manual");
+            LOGI("dlsym FAILED: tidak ada symbol yang cocok");
+        }
+
     } else {
         const char* err = dlerror();
         char buf[256];
