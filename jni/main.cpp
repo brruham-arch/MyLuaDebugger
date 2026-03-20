@@ -11,21 +11,20 @@ typedef struct lua_State lua_State;
 typedef lua_State* (*luaL_newstate_t)(void);
 typedef int        (*DobbyHook_t)(void*, void*, void**);
 
-static lua_State*      g_L                = NULL;
-static luaL_newstate_t g_orig_newstate    = NULL;
+static lua_State*      g_L             = NULL;
+static luaL_newstate_t g_orig_newstate = NULL;
 
 static void writeLog(const char* msg) {
     FILE* f = fopen("/sdcard/luadbg.log", "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
-// Hook luaL_newstate — dipanggil sekali saat startup, return lua_State* langsung
 static lua_State* my_newstate(void) {
     lua_State* L = g_orig_newstate();
     if (!g_L && L) {
         g_L = L;
         char buf[128];
-        snprintf(buf, sizeof(buf), "[Step4] lua_State* CAPTURED via luaL_newstate = 0x%x", (unsigned int)L);
+        snprintf(buf, sizeof(buf), "[Step4] lua_State* CAPTURED = 0x%x", (unsigned int)L);
         writeLog(buf);
         LOGI("%s", buf);
     }
@@ -52,9 +51,14 @@ static void onLoad() {
     void* newstate_addr = dlsym(luajitHandle, "luaL_newstate");
     if (!newstate_addr) { writeLog("[Step3] luaL_newstate symbol FAILED"); return; }
 
-    char buf[128];
-    snprintf(buf, sizeof(buf), "[Step3] luaL_newstate addr=0x%x (size=156 bytes, aman untuk hook)",
-        (unsigned int)newstate_addr);
+    // Cek apakah Thumb: bit 0 dari symbol value di ELF
+    // dlsym return tanpa Thumb bit — kita tambah |1 untuk Thumb
+    uintptr_t addr_raw  = (uintptr_t)newstate_addr;
+    uintptr_t addr_thumb = addr_raw | 1;  // paksa Thumb
+
+    char buf[256];
+    snprintf(buf, sizeof(buf), "[Step3] luaL_newstate raw=0x%x thumb=0x%x",
+        (unsigned int)addr_raw, (unsigned int)addr_thumb);
     writeLog(buf);
 
     void* dobbyHandle = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
@@ -64,11 +68,12 @@ static void onLoad() {
     DobbyHook_t DobbyHook = (DobbyHook_t)dlsym(dobbyHandle, "DobbyHook");
     if (!DobbyHook) { writeLog("[Step4] DobbyHook symbol FAILED"); return; }
 
-    int ret = DobbyHook(newstate_addr, (void*)my_newstate, (void**)&g_orig_newstate);
-    snprintf(buf, sizeof(buf), "[Step4] DobbyHook luaL_newstate result=%d", ret);
+    // Pasang hook dengan Thumb address (|1)
+    int ret = DobbyHook((void*)addr_thumb, (void*)my_newstate, (void**)&g_orig_newstate);
+    snprintf(buf, sizeof(buf), "[Step4] DobbyHook luaL_newstate (Thumb) result=%d", ret);
     writeLog(buf);
 
     if (ret == 0) {
-        writeLog("[Step4] Hook OK — menunggu luaL_newstate dipanggil...");
+        writeLog("[Step4] Hook OK — menunggu luaL_newstate...");
     }
 }
