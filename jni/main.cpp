@@ -155,43 +155,39 @@ static long long getTimeMs() {
     return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
-// ── Ambil argumen dari Lua stack sebagai string JSON ──────────
+// ── Ambil argumen dari Lua stack — hanya tipe, tanpa akses nilai
+// (aman: tidak memanggil lua_tolstring yang bisa crash)
 static void getArgs(lua_State* L, char* out, size_t outLen) {
-    if (!g_gettop || !g_type || !g_typename) {
+    if (!g_gettop || !g_type) {
         strncpy(out, "[]", outLen); return;
     }
     int top = g_gettop(L);
     if (top <= 0) { strncpy(out, "[]", outLen); return; }
 
     char tmp[512] = "[";
-    for (int i = 1; i <= top && i <= 8; i++) {  // max 8 args
+    for (int i = 1; i <= top && i <= 8; i++) {
         int t = g_type(L, i);
-        char val[128] = "null";
-        char esc[200];
+        char val[128];
 
+        // Hanya number dan boolean yang aman dibaca langsung
+        // String dan table hanya catat tipenya saja
         switch (t) {
             case LUA_TNIL:
                 strncpy(val, "null", sizeof(val)); break;
             case LUA_TBOOLEAN:
                 snprintf(val, sizeof(val), "%s",
-                    g_toboolean(L, i) ? "true" : "false"); break;
+                    g_toboolean && g_toboolean(L, i) ? "true" : "false"); break;
             case LUA_TNUMBER:
-                snprintf(val, sizeof(val), "%g", g_tonumber(L, i)); break;
-            case LUA_TSTRING: {
-                const char* s = g_tostring(L, i);
-                if (s) {
-                    jsonEscape(s, esc, sizeof(esc));
-                    snprintf(val, sizeof(val), "\"%s\"", esc);
-                } else {
-                    strncpy(val, "\"\"", sizeof(val));
-                }
-                break;
-            }
-            default: {
-                const char* tn = g_typename ? g_typename(L, t) : "?";
-                snprintf(val, sizeof(val), "\"[%s]\"", tn ? tn : "?");
-                break;
-            }
+                snprintf(val, sizeof(val), "%g",
+                    g_tonumber ? g_tonumber(L, i) : 0.0); break;
+            case LUA_TSTRING:
+                strncpy(val, "\"[string]\"", sizeof(val)); break;
+            case LUA_TTABLE:
+                strncpy(val, "\"[table]\"",  sizeof(val)); break;
+            case LUA_TFUNCTION:
+                strncpy(val, "\"[function]\"", sizeof(val)); break;
+            default:
+                snprintf(val, sizeof(val), "\"[type:%d]\"", t); break;
         }
 
         if (i > 1) strncat(tmp, ",", sizeof(tmp)-strlen(tmp)-1);
