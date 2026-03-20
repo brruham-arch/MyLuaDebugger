@@ -84,8 +84,8 @@ static void loadConfig() {
 }
 
 // ── Buffer JSON ───────────────────────────────────────────────
-#define JSON_BUF_SIZE  300
-#define JSON_LINE_LEN  1024
+#define JSON_BUF_SIZE  1000
+#define JSON_LINE_LEN  512
 
 static char    g_json_buf[JSON_BUF_SIZE][JSON_LINE_LEN];
 static int     g_json_count  = 0;
@@ -225,24 +225,15 @@ static void getStackTrace(lua_State* L, char* out, size_t outLen) {
     strncpy(out, tmp, outLen-1);
 }
 
-// ── Cek apakah event ini dari target script ───────────────────
-static bool isTarget(lua_State* L, const char* src) {
-    if (!g_target[0]) return false;
-
-    // Cek source langsung
-    if (src && strstr(src, g_target)) return true;
-
-    // Cek caller di stack
-    if (g_getstack) {
-        for (int level = 1; level <= 4; level++) {
-            lua_Debug frame;
-            memset(&frame, 0, sizeof(frame));
-            if (!g_getstack(L, level, &frame)) break;
-            if (!g_getinfo(L, "S", &frame)) break;
-            if (frame.source && strstr(frame.source, g_target)) return true;
-        }
-    }
-    return false;
+// ── Cek apakah event ini dari target script (strict: source langsung saja)
+static bool isTarget(const char* src) {
+    if (!g_target[0] || !src) return false;
+    // Strip @ prefix
+    const char* s = (src[0] == '@') ? src+1 : src;
+    // Cek basename mengandung target
+    const char* base = strrchr(s, '/');
+    base = base ? base+1 : s;
+    return (strstr(base, g_target) != NULL);
 }
 
 // ── Lua hook: DEEP mode untuk target script ───────────────────
@@ -253,7 +244,7 @@ void LuaDebugger_hook(lua_State* L, lua_Debug* ar) {
 
     const char* src = ar->source ? ar->source : "?";
 
-    if (!isTarget(L, src)) return;
+    if (!isTarget(src)) return;
 
     const char* evName = "unknown";
     if (ar->event == 0) evName = "call";
