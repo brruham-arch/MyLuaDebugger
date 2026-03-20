@@ -17,6 +17,7 @@ typedef void (*lua_Hook)(lua_State*, lua_Debug*);
 typedef lua_State* (*luaL_newstate_t)(void);
 typedef void       (*lua_sethook_t)(lua_State*, lua_Hook, int, int);
 typedef int        (*lua_getinfo_t)(lua_State*, const char*, lua_Debug*);
+typedef int        (*lua_getstack_t)(lua_State*, int, lua_Debug*);
 
 #define LUA_MASKCALL  1
 #define LUA_MASKRET   2
@@ -35,58 +36,52 @@ struct lua_Debug {
     int i_ci;
 };
 
-static lua_State*      g_L             = NULL;
+// ── Globals ──────────────────────────────────────────────────
 static luaL_newstate_t g_orig_newstate = NULL;
 static lua_sethook_t   g_sethook       = NULL;
 static lua_getinfo_t   g_getinfo       = NULL;
+static lua_getstack_t  g_getstack      = NULL;
 
-// ── Fungsi sensitif yang perlu di-flag ──────────────────────
+// ── Fungsi sensitif ──────────────────────────────────────────
 static const char* SENSITIVE_FUNCS[] = {
-    // Input / keylog
-    "getKeyState", "isKeyDown", "isKeyPressed", "getKey",
-    "GetAsyncKeyState", "onChar", "onKeyDown",
-    // Network / send data
+    "getKeyState", "isKeyDown", "isKeyPressed", "getKey", "onKeyDown",
     "socket", "connect", "send", "http", "request",
-    "sendPacket", "sampSendChat", "sampSendCommand",
-    // String ops yang sering dipakai obfuscator
-    "loadstring", "dostring", "load", "dofile", "loadfile",
-    "pcall", "xpcall", "rawget", "rawset",
-    // Encode/decode
-    "base64", "encode", "decode", "gsub", "byte", "char",
-    // File I/O
-    "open", "write", "io",
+    "sampSendChat", "sampSendCommand",
+    "loadstring", "load", "dofile", "loadfile",
+    "rawget", "rawset",
+    "base64", "encode", "decode",
     NULL
 };
 
 static bool isSensitive(const char* name) {
     if (!name) return false;
-    for (int i = 0; SENSITIVE_FUNCS[i]; i++) {
+    for (int i = 0; SENSITIVE_FUNCS[i]; i++)
         if (strstr(name, SENSITIVE_FUNCS[i])) return true;
-    }
     return false;
 }
 
-// ── Tulis ke file per-script ─────────────────────────────────
-static void writeScriptLog(const char* script, const char* msg) {
-    if (!script || !msg) return;
-
-    // Buat nama file dari nama script (ambil basename, ganti / dan . jadi _)
-    char fname[256] = {0};
-    const char* base = strrchr(script, '/');
-    base = base ? base + 1 : script;
-
-    snprintf(fname, sizeof(fname), "/sdcard/luadbg_%s.log", base);
-    // Ganti karakter tidak valid
-    for (char* p = fname + 12; *p; p++) {
-        if (*p == '/' || *p == ':') *p = '_';
-    }
-
-    FILE* f = fopen(fname, "a");
+// ── Log helpers ──────────────────────────────────────────────
+static void writeLog(const char* msg) {
+    FILE* f = fopen("/sdcard/luadbg.log", "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
-static void writeLog(const char* msg) {
-    FILE* f = fopen("/sdcard/luadbg.log", "a");
+static void writeScriptLog(const char* source, const char* msg) {
+    if (!source || source[0] == '=') return; // skip =[C]
+
+    // Ambil basename dari path
+    const char* base = strrchr(source, '/');
+    base = base ? base + 1 : source;
+    // Strip leading @ kalau ada
+    if (base[0] == '@') base++;
+
+    char fname[300];
+    snprintf(fname, sizeof(fname), "/sdcard/luadbg_%s.log", base);
+    // Sanitasi nama file
+    for (char* p = fname + 12; *p; p++)
+        if (*p == '/' || *p == ':' || *p == ' ') *p = '_';
+
+    FILE* f = fopen(fname, "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
@@ -98,59 +93,66 @@ void LuaDebugger_hook(lua_State* L, lua_Debug* ar) {
 
     const char* src  = ar->source ? ar->source : "?";
     const char* name = ar->name   ? ar->name   : "(anon)";
+    bool isC         = (src[0] == '=');
+    bool sensitive   = isSensitive(name);
 
-    // Skip pure C functions (=[C]) kecuali dipanggil dari Lua script
-    // Kita tetap log kalau namanya sensitif
-    bool isC        = (src[0] == '=');
-    bool sensitive  = isSensitive(name);
-
-    // Skip noise: C calls yang tidak sensitif
+    // Skip C calls yang tidak sensitif
     if (isC && !sensitive) return;
 
     const char* ev = (ar->event == 0) ? "CALL" : "RET ";
     char buf[512];
 
     if (sensitive) {
-        // FLAG! Log ke file utama juga
+        // Log ke luadbg.log dengan caller info
         snprintf(buf, sizeof(buf), "[⚠ SENSITIVE][%s] %s | %s:%d",
             ev, name, src, ar->currentline);
         writeLog(buf);
-        // Cari script pemanggil (level 2)
-        lua_Debug caller;
-        if (g_getinfo(L, "nSl", &caller)) {
-            char buf2[512];
-            snprintf(buf2, sizeof(buf2), "  └─ dipanggil dari: %s:%d (%s)",
-                caller.source ? caller.source : "?",
-                caller.currentline,
-                caller.name ? caller.name : "(anon)");
-            writeLog(buf2);
+
+        // Cari caller pakai lua_getstack level 1
+        if (g_getstack) {
+            lua_Debug caller;
+            memset(&caller, 0, sizeof(caller));
+            if (g_getstack(L, 1, &caller) && g_getinfo(L, "nSl", &caller)) {
+                snprintf(buf, sizeof(buf), "  └─ dari: %s:%d (%s)",
+                    caller.source ? caller.source : "?",
+                    caller.currentline,
+                    caller.name ? caller.name : "(anon)");
+                writeLog(buf);
+            }
         }
     }
 
-    // Log ke file per-script (hanya Lua functions, skip =[C])
+    // Log ke file per-script (hanya Lua functions)
     if (!isC) {
         snprintf(buf, sizeof(buf), "[%s] %s | line %d",
             ev, name, ar->currentline);
         writeScriptLog(src, buf);
+    } else if (sensitive) {
+        // Sensitive C func dipanggil dari script — log ke script caller
+        if (g_getstack) {
+            lua_Debug caller;
+            memset(&caller, 0, sizeof(caller));
+            if (g_getstack(L, 1, &caller) && g_getinfo(L, "nSl", &caller)) {
+                snprintf(buf, sizeof(buf), "[%s][⚠ SENSITIVE-C] %s | line %d",
+                    ev, name, caller.currentline);
+                writeScriptLog(caller.source ? caller.source : "?", buf);
+            }
+        }
     }
 }
 
-// ── GOT hook: luaL_newstate ───────────────────────────────────
+// ── GOT hook: luaL_newstate — dipanggil SETIAP script baru ──
 extern "C" __attribute__((visibility("default")))
 lua_State* LuaDebugger_newstate_hook(void) {
     lua_State* L = g_orig_newstate();
-    if (!g_L && L) {
-        g_L = L;
-        char buf[128];
-        snprintf(buf, sizeof(buf), "[HOOK] lua_State* CAPTURED = 0x%x", (unsigned int)L);
-        writeLog(buf);
-
-        if (g_sethook) {
-            void* hookFn = dlsym(RTLD_DEFAULT, "LuaDebugger_hook");
-            if (hookFn) {
-                g_sethook(L, (lua_Hook)hookFn, LUA_MASKCALL | LUA_MASKRET, 0);
-                writeLog("[HOOK] lua_sethook terpasang");
-            }
+    if (L) {
+        // Hook SETIAP lua_State — tidak ada guard g_L
+        void* hookFn = dlsym(RTLD_DEFAULT, "LuaDebugger_hook");
+        if (hookFn && g_sethook) {
+            g_sethook(L, (lua_Hook)hookFn, LUA_MASKCALL | LUA_MASKRET, 0);
+            char buf[128];
+            snprintf(buf, sizeof(buf), "[HOOK] lua_State=0x%x hooked", (unsigned int)L);
+            writeLog(buf);
         }
     }
     return L;
@@ -187,7 +189,6 @@ static bool getSelfPath(char* out, size_t sz) {
 }
 
 static bool patchGOT(uintptr_t base, const char* symName, void* newFunc) {
-    char buf[256];
     Elf32_Ehdr* ehdr = (Elf32_Ehdr*)base;
     if (ehdr->e_ident[0] != 0x7f) return false;
     Elf32_Phdr* phdr = (Elf32_Phdr*)(base + ehdr->e_phoff);
@@ -214,8 +215,10 @@ static bool patchGOT(uintptr_t base, const char* symName, void* newFunc) {
         mprotect((void*)page, getpagesize(), PROT_READ | PROT_WRITE);
         *got = (uint32_t)(uintptr_t)newFunc;
         mprotect((void*)page, getpagesize(), PROT_READ);
+        char buf[128];
         snprintf(buf, sizeof(buf), "[GOT] patched '%s' -> 0x%x", symName, (unsigned int)newFunc);
-        writeLog(buf); return true;
+        writeLog(buf);
+        return true;
     }
     return false;
 }
@@ -224,7 +227,6 @@ __attribute__((constructor))
 static void onLoad() {
     LOGI("LuaDebugger loaded!");
     writeLog("=== LuaDebugger START ===");
-    writeLog("[LuaDebugger] Mode: per-script grouping + sensitive flag");
 
     static int initialized = 0;
     if (initialized) return;
@@ -239,6 +241,8 @@ static void onLoad() {
     g_orig_newstate = (luaL_newstate_t)dlsym(luajitHandle, "luaL_newstate");
     g_sethook       = (lua_sethook_t)  dlsym(luajitHandle, "lua_sethook");
     g_getinfo       = (lua_getinfo_t)  dlsym(luajitHandle, "lua_getinfo");
+    g_getstack      = (lua_getstack_t) dlsym(luajitHandle, "lua_getstack");
+
     if (!g_orig_newstate || !g_sethook || !g_getinfo) {
         writeLog("[Step3] symbol FAILED"); return;
     }
@@ -260,8 +264,8 @@ static void onLoad() {
     if (!monetBase) { writeLog("[GOT] base FAILED"); return; }
 
     if (patchGOT(monetBase, "luaL_newstate", (void*)hookFn_thumb)) {
-        writeLog("[GOT] Patch SUCCESS");
-        writeLog("[INFO] Log per-script: /sdcard/luadbg_<scriptname>.log");
-        writeLog("[INFO] Sensitive flags: /sdcard/luadbg.log");
+        writeLog("[GOT] Patch SUCCESS — setiap script akan di-hook otomatis");
+        writeLog("[INFO] Per-script: /sdcard/luadbg_<nama>.log");
+        writeLog("[INFO] Sensitive: /sdcard/luadbg.log");
     }
 }
