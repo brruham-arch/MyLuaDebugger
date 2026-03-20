@@ -1865,26 +1865,38 @@ void LuaDebugger_hook(lua_State* L, lua_Debug* ar) {
     g_getinfo(L, "nS", ar);
 
     if (!ar->name) return;
-    if (!isGlobalAPI(ar->name)) return;
 
-    // Untuk C function (=[C]), source-nya bukan script — cek caller
+    // Skip nama sangat pendek (noise)
+    if (strlen(ar->name) <= 1) return;
+
+    // Cek apakah berasal dari target script
     bool fromTarget = false;
     if (ar->source && ar->source[0] != '=') {
-        // Lua function — cek source langsung
         fromTarget = sourceIsTarget(ar->source);
     } else if (g_getstack) {
-        // C function — cek siapa yang memanggil
         lua_Debug caller;
         memset(&caller, 0, sizeof(caller));
         if (g_getstack(L, 1, &caller) && g_getinfo(L, "S", &caller)) {
             fromTarget = sourceIsTarget(caller.source);
         }
     }
-
     if (!fromTarget) return;
 
+    // Format: untuk field/method, tambah prefix tipe
+    char entry[FUNC_LEN];
+    if (ar->namewhat && strcmp(ar->namewhat, "field") == 0) {
+        snprintf(entry, sizeof(entry), "[field] %s", ar->name);
+    } else if (ar->namewhat && strcmp(ar->namewhat, "method") == 0) {
+        snprintf(entry, sizeof(entry), "[method] %s", ar->name);
+    } else if (ar->namewhat && strcmp(ar->namewhat, "global") == 0) {
+        snprintf(entry, sizeof(entry), "[global] %s", ar->name);
+    } else {
+        snprintf(entry, sizeof(entry), "[%s] %s",
+            ar->namewhat ? ar->namewhat : "?", ar->name);
+    }
+
     pthread_mutex_lock(&g_mutex);
-    addFunc(ar->name);
+    addFunc(entry);
     pthread_mutex_unlock(&g_mutex);
 }
 
