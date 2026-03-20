@@ -11,19 +11,61 @@
 #define TAG "LuaDebugger"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
+// ── Lua types ────────────────────────────────────────────────
 typedef struct lua_State lua_State;
+typedef struct lua_Debug lua_Debug;
+typedef void (*lua_Hook)(lua_State*, lua_Debug*);
 typedef lua_State* (*luaL_newstate_t)(void);
+typedef void       (*lua_sethook_t)(lua_State*, lua_Hook, int, int);
+typedef int        (*lua_getinfo_t)(lua_State*, const char*, lua_Debug*);
 
+#define LUA_MASKCALL  1
+#define LUA_MASKRET   2
+
+struct lua_Debug {
+    int event;
+    const char* name;
+    const char* namewhat;
+    const char* what;
+    const char* source;
+    int currentline;
+    int nups;
+    int linedefined;
+    int lastlinedefined;
+    char short_src[60];
+    int i_ci;
+};
+
+// ── Globals ──────────────────────────────────────────────────
 static lua_State*      g_L             = NULL;
 static luaL_newstate_t g_orig_newstate = NULL;
+static lua_sethook_t   g_sethook       = NULL;
+static lua_getinfo_t   g_getinfo       = NULL;
 
+// ── Log helper ───────────────────────────────────────────────
 static void writeLog(const char* msg) {
     FILE* f = fopen("/sdcard/luadbg.log", "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
-// Fungsi ini akan dipanggil via GOT hook
-// extern "C" agar tidak mangle, visibility default agar di-export
+// ── Lua debug hook ───────────────────────────────────────────
+extern "C" __attribute__((visibility("default")))
+void LuaDebugger_hook(lua_State* L, lua_Debug* ar) {
+    if (!g_getinfo) return;
+    g_getinfo(L, "nSl", ar);
+
+    const char* ev = (ar->event == 0) ? "CALL" : "RET";
+    char buf[256];
+    snprintf(buf, sizeof(buf), "[%s] %s | %s:%d",
+        ev,
+        ar->name   ? ar->name   : "(anon)",
+        ar->source ? ar->source : "?",
+        ar->currentline
+    );
+    writeLog(buf);
+}
+
+// ── GOT hook: luaL_newstate ───────────────────────────────────
 extern "C" __attribute__((visibility("default")))
 lua_State* LuaDebugger_newstate_hook(void) {
     lua_State* L = g_orig_newstate();
@@ -33,10 +75,23 @@ lua_State* LuaDebugger_newstate_hook(void) {
         snprintf(buf, sizeof(buf), "[HOOK] lua_State* CAPTURED = 0x%x", (unsigned int)L);
         writeLog(buf);
         LOGI("%s", buf);
+
+        // Pasang debug hook sekarang
+        if (g_sethook) {
+            // Ambil fn hook via RTLD_DEFAULT agar dari trusted region
+            void* hookFn = dlsym(RTLD_DEFAULT, "LuaDebugger_hook");
+            if (hookFn) {
+                g_sethook(L, (lua_Hook)hookFn, LUA_MASKCALL | LUA_MASKRET, 0);
+                writeLog("[HOOK] lua_sethook terpasang -> monitoring CALL & RET");
+            } else {
+                writeLog("[HOOK] LuaDebugger_hook symbol not found");
+            }
+        }
     }
     return L;
 }
 
+// ── Helpers ──────────────────────────────────────────────────
 static uintptr_t getLibBase(const char* name) {
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return 0;
@@ -51,17 +106,13 @@ static uintptr_t getLibBase(const char* name) {
     return (base == UINTPTR_MAX) ? 0 : base;
 }
 
-// Cari path .so kita sendiri dari /proc/self/maps
 static bool getSelfPath(char* out, size_t sz) {
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return false;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         if (!strstr(line, "libLuaDebugger.so")) continue;
-        // Format: addr-addr perms offset dev inode path
-        char* path = strrchr(line, '/');
-        if (!path) continue;
-        path = strstr(line, "/data");
+        char* path = strstr(line, "/data");
         if (!path) continue;
         size_t len = strlen(path);
         if (path[len-1] == '\n') path[len-1] = '\0';
@@ -82,8 +133,7 @@ static bool patchGOT(uintptr_t base, const char* symName, void* newFunc) {
     Elf32_Dyn* dyn = NULL;
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_DYNAMIC) {
-            dyn = (Elf32_Dyn*)(base + phdr[i].p_vaddr);
-            break;
+            dyn = (Elf32_Dyn*)(base + phdr[i].p_vaddr); break;
         }
     }
     if (!dyn) { writeLog("[GOT] no PT_DYNAMIC"); return false; }
@@ -91,9 +141,9 @@ static bool patchGOT(uintptr_t base, const char* symName, void* newFunc) {
     Elf32_Sym* symtab = NULL; const char* strtab = NULL;
     Elf32_Rel* jmprel = NULL; size_t jmprel_sz = 0;
     for (Elf32_Dyn* d = dyn; d->d_tag != DT_NULL; d++) {
-        if (d->d_tag == DT_SYMTAB)   symtab    = (Elf32_Sym*)(base + d->d_un.d_ptr);
+        if (d->d_tag == DT_SYMTAB)   symtab    = (Elf32_Sym*) (base + d->d_un.d_ptr);
         if (d->d_tag == DT_STRTAB)   strtab    = (const char*)(base + d->d_un.d_ptr);
-        if (d->d_tag == DT_JMPREL)   jmprel    = (Elf32_Rel*)(base + d->d_un.d_ptr);
+        if (d->d_tag == DT_JMPREL)   jmprel    = (Elf32_Rel*) (base + d->d_un.d_ptr);
         if (d->d_tag == DT_PLTRELSZ) jmprel_sz = d->d_un.d_val;
     }
     if (!symtab || !strtab || !jmprel) { writeLog("[GOT] null sections"); return false; }
@@ -103,7 +153,8 @@ static bool patchGOT(uintptr_t base, const char* symName, void* newFunc) {
         if (strcmp(strtab + symtab[sym_idx].st_name, symName) != 0) continue;
 
         uint32_t* got = (uint32_t*)(base + jmprel[i].r_offset);
-        snprintf(buf, sizeof(buf), "[GOT] found '%s' at 0x%x cur=0x%x", symName, (unsigned int)got, *got);
+        snprintf(buf, sizeof(buf), "[GOT] found '%s' GOT=0x%x cur=0x%x",
+            symName, (unsigned int)got, *got);
         writeLog(buf);
 
         uintptr_t page = (uintptr_t)got & ~((uintptr_t)(getpagesize()-1));
@@ -118,6 +169,7 @@ static bool patchGOT(uintptr_t base, const char* symName, void* newFunc) {
     writeLog("[GOT] symbol not found"); return false;
 }
 
+// ── Constructor ──────────────────────────────────────────────
 __attribute__((constructor))
 static void onLoad() {
     LOGI("LuaDebugger loaded!");
@@ -136,57 +188,41 @@ static void onLoad() {
     writeLog("[Step3] dlopen libluajit-5.1.so SUCCESS");
 
     g_orig_newstate = (luaL_newstate_t)dlsym(luajitHandle, "luaL_newstate");
-    if (!g_orig_newstate) { writeLog("[Step3] luaL_newstate FAILED"); return; }
+    g_sethook       = (lua_sethook_t)  dlsym(luajitHandle, "lua_sethook");
+    g_getinfo       = (lua_getinfo_t)  dlsym(luajitHandle, "lua_getinfo");
 
-    char buf[512];
-    snprintf(buf, sizeof(buf), "[Step3] orig luaL_newstate=0x%x", (unsigned int)g_orig_newstate);
-    writeLog(buf);
-
-    // Kunci: dlopen diri kita sendiri via SYSTEM LINKER
-    // sehingga hook function ada di properly-executable region
-    char selfPath[512] = {0};
-    if (!getSelfPath(selfPath, sizeof(selfPath))) {
-        writeLog("[Self] getSelfPath FAILED — fallback ke nama saja");
-        strcpy(selfPath, "libLuaDebugger.so");
+    if (!g_orig_newstate || !g_sethook || !g_getinfo) {
+        writeLog("[Step3] symbol FAILED"); return;
     }
-    snprintf(buf, sizeof(buf), "[Self] path=%s", selfPath);
+
+    char buf[256];
+    snprintf(buf, sizeof(buf), "[Step3] newstate=0x%x sethook=0x%x getinfo=0x%x",
+        (unsigned int)g_orig_newstate,
+        (unsigned int)g_sethook,
+        (unsigned int)g_getinfo);
     writeLog(buf);
+
+    // dlopen self via system linker
+    char selfPath[512] = {0};
+    getSelfPath(selfPath, sizeof(selfPath));
+    if (!selfPath[0]) strcpy(selfPath, "libLuaDebugger.so");
 
     void* selfHandle = dlopen(selfPath, RTLD_NOW | RTLD_GLOBAL);
-    if (!selfHandle) {
-        const char* err = dlerror();
-        snprintf(buf, sizeof(buf), "[Self] dlopen FAILED: %s", err ? err : "?");
-        writeLog(buf);
-        return;
-    }
+    if (!selfHandle) { writeLog("[Self] dlopen FAILED"); return; }
     writeLog("[Self] dlopen self SUCCESS");
 
-    // Ambil hook function — coba dari handle dulu, fallback ke RTLD_DEFAULT
     void* hookFn = dlsym(selfHandle, "LuaDebugger_newstate_hook");
-    if (!hookFn) {
-        writeLog("[Self] dlsym(handle) FAILED, coba RTLD_DEFAULT...");
-        hookFn = dlsym(RTLD_DEFAULT, "LuaDebugger_newstate_hook");
-    }
-    if (!hookFn) {
-        writeLog("[Self] LuaDebugger_newstate_hook symbol FAILED semua cara");
-        return;
-    }
-    snprintf(buf, sizeof(buf), "[Self] hook fn=0x%x", (unsigned int)hookFn);
-    writeLog(buf);
+    if (!hookFn) hookFn = dlsym(RTLD_DEFAULT, "LuaDebugger_newstate_hook");
+    if (!hookFn) { writeLog("[Self] newstate_hook symbol FAILED"); return; }
 
-    // Thumb bit
     uintptr_t hookFn_thumb = ((uintptr_t)hookFn & ~1u) | 1u;
-    snprintf(buf, sizeof(buf), "[Self] hook fn_thumb=0x%x", (unsigned int)hookFn_thumb);
+    snprintf(buf, sizeof(buf), "[Self] hook=0x%x", (unsigned int)hookFn_thumb);
     writeLog(buf);
 
     uintptr_t monetBase = getLibBase("libmonetloader.so");
-    snprintf(buf, sizeof(buf), "[GOT] monet base=0x%x", (unsigned int)monetBase);
-    writeLog(buf);
     if (!monetBase) { writeLog("[GOT] base FAILED"); return; }
 
     if (patchGOT(monetBase, "luaL_newstate", (void*)hookFn_thumb)) {
         writeLog("[GOT] Patch SUCCESS — menunggu luaL_newstate...");
-    } else {
-        writeLog("[GOT] Patch FAILED");
     }
 }
