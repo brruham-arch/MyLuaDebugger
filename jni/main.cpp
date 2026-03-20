@@ -18,6 +18,7 @@ typedef void   (*lua_Hook)(lua_State*, lua_Debug*);
 typedef lua_State* (*luaL_newstate_t)(void);
 typedef void       (*lua_sethook_t)(lua_State*, lua_Hook, int, int);
 typedef int        (*lua_getinfo_t)(lua_State*, const char*, lua_Debug*);
+typedef int        (*lua_getstack_t)(lua_State*, int, lua_Debug*);
 
 #define LUA_MASKCALL 1
 
@@ -38,6 +39,7 @@ struct lua_Debug {
 static luaL_newstate_t g_orig_newstate = NULL;
 static lua_sethook_t   g_sethook       = NULL;
 static lua_getinfo_t   g_getinfo       = NULL;
+static lua_getstack_t  g_getstack      = NULL;
 static char            g_target[128]   = {0};
 
 // ── Global API list dari api_dump ─────────────────────────────
@@ -1847,22 +1849,39 @@ static void flush() {
     g_dirty = false;
 }
 
+// ── Cek apakah source adalah target script ───────────────────
+static bool sourceIsTarget(const char* source) {
+    if (!source) return false;
+    const char* s = (source[0] == '@') ? source+1 : source;
+    const char* base = strrchr(s, '/');
+    base = base ? base+1 : s;
+    return strstr(base, g_target) != NULL;
+}
+
 // ── Hook ──────────────────────────────────────────────────────
 extern "C" __attribute__((visibility("default")))
 void LuaDebugger_hook(lua_State* L, lua_Debug* ar) {
     if (!g_getinfo || !g_target[0]) return;
     g_getinfo(L, "nS", ar);
 
-    // Hanya dari target script
-    if (!ar->source) return;
-    const char* src = ar->source[0] == '@' ? ar->source+1 : ar->source;
-    const char* base = strrchr(src, '/');
-    base = base ? base+1 : src;
-    if (!strstr(base, g_target)) return;
-
-    // Hanya Global API
     if (!ar->name) return;
     if (!isGlobalAPI(ar->name)) return;
+
+    // Untuk C function (=[C]), source-nya bukan script — cek caller
+    bool fromTarget = false;
+    if (ar->source && ar->source[0] != '=') {
+        // Lua function — cek source langsung
+        fromTarget = sourceIsTarget(ar->source);
+    } else if (g_getstack) {
+        // C function — cek siapa yang memanggil
+        lua_Debug caller;
+        memset(&caller, 0, sizeof(caller));
+        if (g_getstack(L, 1, &caller) && g_getinfo(L, "S", &caller)) {
+            fromTarget = sourceIsTarget(caller.source);
+        }
+    }
+
+    if (!fromTarget) return;
 
     pthread_mutex_lock(&g_mutex);
     addFunc(ar->name);
@@ -1981,6 +2000,7 @@ static void onLoad() {
     g_orig_newstate = (luaL_newstate_t)dlsym(luajit, "luaL_newstate");
     g_sethook       = (lua_sethook_t)  dlsym(luajit, "lua_sethook");
     g_getinfo       = (lua_getinfo_t)  dlsym(luajit, "lua_getinfo");
+    g_getstack      = (lua_getstack_t) dlsym(luajit, "lua_getstack");
     if (!g_orig_newstate || !g_sethook || !g_getinfo) {
         writeLog("[LuaJIT] symbol FAILED"); return;
     }
