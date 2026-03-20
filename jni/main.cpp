@@ -23,8 +23,8 @@ static void writeLog(const char* msg) {
 }
 
 // Fungsi ini akan dipanggil via GOT hook
-// HARUS diakses dari system linker region, bukan AML malloc region
-__attribute__((visibility("default")))
+// extern "C" agar tidak mangle, visibility default agar di-export
+extern "C" __attribute__((visibility("default")))
 lua_State* LuaDebugger_newstate_hook(void) {
     lua_State* L = g_orig_newstate();
     if (!g_L && L) {
@@ -161,10 +161,14 @@ static void onLoad() {
     }
     writeLog("[Self] dlopen self SUCCESS");
 
-    // Ambil hook function dari system-linker-loaded handle
+    // Ambil hook function — coba dari handle dulu, fallback ke RTLD_DEFAULT
     void* hookFn = dlsym(selfHandle, "LuaDebugger_newstate_hook");
     if (!hookFn) {
-        writeLog("[Self] LuaDebugger_newstate_hook symbol FAILED");
+        writeLog("[Self] dlsym(handle) FAILED, coba RTLD_DEFAULT...");
+        hookFn = dlsym(RTLD_DEFAULT, "LuaDebugger_newstate_hook");
+    }
+    if (!hookFn) {
+        writeLog("[Self] LuaDebugger_newstate_hook symbol FAILED semua cara");
         return;
     }
     snprintf(buf, sizeof(buf), "[Self] hook fn=0x%x", (unsigned int)hookFn);
