@@ -22,6 +22,7 @@ static void writeLog(const char* msg) {
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
+// Fungsi replacement — harus di-make executable sebelum GOT patch
 static lua_State* my_newstate(void) {
     lua_State* L = g_orig_newstate();
     if (!g_L && L) {
@@ -34,7 +35,17 @@ static lua_State* my_newstate(void) {
     return L;
 }
 
-// Ambil address TERKECIL dari semua mapping library — itu ELF base
+// Buat halaman yang mengandung fungsi 'fn' menjadi RX
+static bool makeExec(void* fn) {
+    uintptr_t addr  = (uintptr_t)fn & ~1u; // strip Thumb bit
+    uintptr_t page  = addr & ~((uintptr_t)(getpagesize()-1));
+    int ret = mprotect((void*)page, getpagesize(), PROT_READ | PROT_EXEC);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "[EXEC] mprotect page=0x%x ret=%d", (unsigned int)page, ret);
+    writeLog(buf);
+    return ret == 0;
+}
+
 static uintptr_t getLibBase(const char* name) {
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return 0;
@@ -51,23 +62,15 @@ static uintptr_t getLibBase(const char* name) {
 
 static bool patchGOT(uintptr_t base, const char* symName, void* newFunc) {
     if (!base) return false;
-
     char buf[256];
 
-    // Validasi ELF magic
     Elf32_Ehdr* ehdr = (Elf32_Ehdr*)base;
-    snprintf(buf, sizeof(buf), "[GOT] ELF magic: %02x %02x %02x %02x",
-        ehdr->e_ident[0], ehdr->e_ident[1], ehdr->e_ident[2], ehdr->e_ident[3]);
-    writeLog(buf);
-
     if (ehdr->e_ident[0] != 0x7f || ehdr->e_ident[1] != 'E') {
-        writeLog("[GOT] ELF magic invalid, cek base");
-        return false;
+        writeLog("[GOT] ELF magic invalid"); return false;
     }
 
     Elf32_Phdr* phdr = (Elf32_Phdr*)(base + ehdr->e_phoff);
-
-    Elf32_Dyn* dyn = NULL;
+    Elf32_Dyn*  dyn  = NULL;
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_DYNAMIC) {
             dyn = (Elf32_Dyn*)(base + phdr[i].p_vaddr);
@@ -89,40 +92,32 @@ static bool patchGOT(uintptr_t base, const char* symName, void* newFunc) {
             case DT_PLTRELSZ: jmprel_sz = d->d_un.d_val; break;
         }
     }
-
     if (!symtab || !strtab || !jmprel) {
         writeLog("[GOT] symtab/strtab/jmprel NULL"); return false;
     }
 
     size_t count = jmprel_sz / sizeof(Elf32_Rel);
-    snprintf(buf, sizeof(buf), "[GOT] scanning %zu PLT entries", count);
-    writeLog(buf);
-
     for (size_t i = 0; i < count; i++) {
         uint32_t    sym_idx = ELF32_R_SYM(jmprel[i].r_info);
         const char* name    = strtab + symtab[sym_idx].st_name;
+        if (strcmp(name, symName) != 0) continue;
 
-        if (strcmp(name, symName) == 0) {
-            uint32_t* got_entry = (uint32_t*)(base + jmprel[i].r_offset);
+        uint32_t* got_entry = (uint32_t*)(base + jmprel[i].r_offset);
+        snprintf(buf, sizeof(buf), "[GOT] found '%s' GOT=0x%x cur=0x%x",
+            symName, (unsigned int)got_entry, *got_entry);
+        writeLog(buf);
 
-            snprintf(buf, sizeof(buf), "[GOT] found '%s' GOT=0x%x cur_val=0x%x",
-                symName, (unsigned int)got_entry, *got_entry);
-            writeLog(buf);
-
-            uintptr_t page = (uintptr_t)got_entry & ~(getpagesize()-1);
-            if (mprotect((void*)page, getpagesize(), PROT_READ | PROT_WRITE) != 0) {
-                writeLog("[GOT] mprotect FAILED"); return false;
-            }
-
-            *got_entry = (uint32_t)(uintptr_t)newFunc;
-            mprotect((void*)page, getpagesize(), PROT_READ);
-
-            snprintf(buf, sizeof(buf), "[GOT] patched! -> 0x%x", (unsigned int)newFunc);
-            writeLog(buf);
-            return true;
+        uintptr_t page = (uintptr_t)got_entry & ~((uintptr_t)(getpagesize()-1));
+        if (mprotect((void*)page, getpagesize(), PROT_READ | PROT_WRITE) != 0) {
+            writeLog("[GOT] mprotect RW FAILED"); return false;
         }
-    }
+        *got_entry = (uint32_t)(uintptr_t)newFunc;
+        mprotect((void*)page, getpagesize(), PROT_READ);
 
+        snprintf(buf, sizeof(buf), "[GOT] patched -> 0x%x", (unsigned int)newFunc);
+        writeLog(buf);
+        return true;
+    }
     writeLog("[GOT] symbol not found in PLT");
     return false;
 }
@@ -151,14 +146,25 @@ static void onLoad() {
     snprintf(buf, sizeof(buf), "[Step3] orig luaL_newstate=0x%x", (unsigned int)g_orig_newstate);
     writeLog(buf);
 
-    // Ambil base terkecil
+    // Pastikan my_newstate page-nya executable
+    snprintf(buf, sizeof(buf), "[EXEC] my_newstate addr=0x%x", (unsigned int)my_newstate);
+    writeLog(buf);
+    if (!makeExec((void*)my_newstate)) {
+        writeLog("[EXEC] FAILED — abort"); return;
+    }
+    writeLog("[EXEC] my_newstate page is now RX");
+
     uintptr_t monetBase = getLibBase("libmonetloader.so");
     snprintf(buf, sizeof(buf), "[GOT] libmonetloader.so base=0x%x", (unsigned int)monetBase);
     writeLog(buf);
-
     if (!monetBase) { writeLog("[GOT] base FAILED"); return; }
 
-    if (patchGOT(monetBase, "luaL_newstate", (void*)my_newstate)) {
+    // Simpan function pointer dengan Thumb bit (|1) untuk GOT entry
+    uintptr_t fn_thumb = ((uintptr_t)my_newstate & ~1u) | 1u;
+    snprintf(buf, sizeof(buf), "[GOT] fn_thumb=0x%x", (unsigned int)fn_thumb);
+    writeLog(buf);
+
+    if (patchGOT(monetBase, "luaL_newstate", (void*)fn_thumb)) {
         writeLog("[GOT] Patch SUCCESS — menunggu luaL_newstate call...");
     } else {
         writeLog("[GOT] Patch FAILED");
