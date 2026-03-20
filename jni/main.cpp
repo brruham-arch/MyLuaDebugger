@@ -20,7 +20,7 @@ typedef void       (*lua_sethook_t)(lua_State*, lua_Hook, int, int);
 typedef int        (*lua_getinfo_t)(lua_State*, const char*, lua_Debug*);
 typedef int        (*lua_getstack_t)(lua_State*, int, lua_Debug*);
 
-#define LUA_MASKCALL  1
+#define LUA_MASKCALL 1
 
 struct lua_Debug {
     int event;
@@ -41,96 +41,131 @@ static lua_sethook_t   g_sethook       = NULL;
 static lua_getinfo_t   g_getinfo       = NULL;
 static lua_getstack_t  g_getstack      = NULL;
 
-// ── Daftar fungsi yang mau di-track ──────────────────────────
-// Edit sesuai kebutuhan
-static const char* TRACKED_FUNCS[] = {
-    "sampRegisterChatCommand",
-    "sampSendChat",
-    "sampAddChatMessage",
-    "sendToWebhook",
-    "request",
-    "connect",
-    // tambah fungsi lain di sini
-    NULL
+// ── Data struktur: funcName -> [script1, script2, ...] ───────
+#define MAX_FUNCS    1500   // max fungsi unik
+#define MAX_SCRIPTS  40     // max script per fungsi
+#define FUNC_LEN     64
+#define SCRIPT_LEN   48
+
+struct FuncEntry {
+    char  name[FUNC_LEN];
+    char  scripts[MAX_SCRIPTS][SCRIPT_LEN];
+    int   script_count;
+    bool  used;
 };
 
-// ── Buffer in-memory ─────────────────────────────────────────
-#define BUF_SIZE  512
-#define LINE_LEN  256
-
-static char   g_buf[BUF_SIZE][LINE_LEN];
-static int    g_count = 0;
+static FuncEntry      g_entries[MAX_FUNCS];
+static int            g_entry_count = 0;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static void flushBuf() {
-    if (g_count == 0) return;
-    FILE* f = fopen("/sdcard/luadbg_tracker.log", "a");
-    if (f) {
-        for (int i = 0; i < g_count; i++)
-            fprintf(f, "%s\n", g_buf[i]);
-        fclose(f);
-    }
-    g_count = 0;
-}
-
-static void addLine(const char* msg) {
-    pthread_mutex_lock(&g_mutex);
-    if (g_count < BUF_SIZE) {
-        strncpy(g_buf[g_count++], msg, LINE_LEN-1);
-        if (g_count >= BUF_SIZE) flushBuf();
-    }
-    pthread_mutex_unlock(&g_mutex);
-}
+static bool           g_dirty = false; // ada data baru sejak flush terakhir
 
 static void writeLog(const char* msg) {
     FILE* f = fopen("/sdcard/luadbg.log", "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
-// ── Cek apakah fungsi di-track ───────────────────────────────
-static bool isTracked(const char* name) {
-    if (!name) return false;
-    for (int i = 0; TRACKED_FUNCS[i]; i++)
-        if (strcmp(name, TRACKED_FUNCS[i]) == 0) return true;
-    return false;
+// Cari atau buat entry untuk fungsi ini
+static FuncEntry* getEntry(const char* funcName) {
+    for (int i = 0; i < g_entry_count; i++) {
+        if (strcmp(g_entries[i].name, funcName) == 0)
+            return &g_entries[i];
+    }
+    if (g_entry_count >= MAX_FUNCS) return NULL;
+    FuncEntry* e = &g_entries[g_entry_count++];
+    memset(e, 0, sizeof(*e));
+    strncpy(e->name, funcName, FUNC_LEN-1);
+    e->used = true;
+    return e;
+}
+
+// Tambah script ke entry — skip kalau sudah ada (deduplicate)
+static void addScript(FuncEntry* e, const char* scriptName) {
+    for (int i = 0; i < e->script_count; i++) {
+        if (strcmp(e->scripts[i], scriptName) == 0)
+            return; // sudah ada
+    }
+    if (e->script_count >= MAX_SCRIPTS) return;
+    strncpy(e->scripts[e->script_count++], scriptName, SCRIPT_LEN-1);
+    g_dirty = true;
+}
+
+// Ambil basename dari path script
+static void getBasename(const char* src, char* out, size_t sz) {
+    if (!src || src[0] == '=') { strncpy(out, "?", sz); return; }
+    const char* s = src[0] == '@' ? src+1 : src;
+    const char* base = strrchr(s, '/');
+    base = base ? base+1 : s;
+    strncpy(out, base, sz-1);
+    out[sz-1] = '\0';
+}
+
+// Cek apakah source adalah user script (bukan lib internal)
+static bool isUserScript(const char* src) {
+    if (!src || src[0] == '=') return false;
+    if (!strstr(src, ".lua")) return false;
+    return true;
+}
+
+// Flush ke file dalam format ringkas
+static void flushToFile() {
+    if (!g_dirty) return;
+
+    FILE* f = fopen("/sdcard/luadbg_api_usage.log", "w");
+    if (!f) return;
+
+    fprintf(f, "=== API Usage (fungsi: script yang menggunakan) ===\n");
+    fprintf(f, "Total fungsi terpantau: %d\n\n", g_entry_count);
+
+    for (int i = 0; i < g_entry_count; i++) {
+        FuncEntry* e = &g_entries[i];
+        if (e->script_count == 0) continue;
+
+        // Format: funcName : script1, script2, script3
+        fprintf(f, "%-40s: ", e->name);
+        for (int j = 0; j < e->script_count; j++) {
+            if (j > 0) fprintf(f, ", ");
+            fprintf(f, "%s", e->scripts[j]);
+        }
+        fprintf(f, "\n");
+    }
+    fclose(f);
+    g_dirty = false;
 }
 
 // ── Lua hook ─────────────────────────────────────────────────
 extern "C" __attribute__((visibility("default")))
 void LuaDebugger_hook(lua_State* L, lua_Debug* ar) {
     if (!g_getinfo) return;
-    g_getinfo(L, "nSl", ar);
+    g_getinfo(L, "nS", ar); // hanya butuh name dan source
 
-    if (!isTracked(ar->name)) return;
+    // Skip kalau tidak ada nama fungsi
+    if (!ar->name) return;
 
-    // Cari caller (siapa yang memanggil fungsi ini)
-    char caller_src[128]  = "?";
-    char caller_func[64]  = "(anon)";
-    int  caller_line      = -1;
+    // Kita track semua fungsi, tapi caller harus dari user script
+    // Cari dari mana fungsi ini dipanggil
+    char caller_script[SCRIPT_LEN] = {0};
 
-    if (g_getstack) {
+    if (ar->source && isUserScript(ar->source)) {
+        // Fungsi Lua — source langsung adalah scriptnya
+        getBasename(ar->source, caller_script, sizeof(caller_script));
+    } else if (g_getstack) {
+        // Fungsi C dipanggil dari Lua — cari caller di stack level 1
         lua_Debug caller;
         memset(&caller, 0, sizeof(caller));
-        if (g_getstack(L, 1, &caller) && g_getinfo(L, "nSl", &caller)) {
-            if (caller.source) {
-                // Ambil basename saja agar ringkas
-                const char* base = strrchr(caller.source, '/');
-                strncpy(caller_src, base ? base+1 : caller.source, sizeof(caller_src)-1);
+        if (g_getstack(L, 1, &caller) && g_getinfo(L, "S", &caller)) {
+            if (caller.source && isUserScript(caller.source)) {
+                getBasename(caller.source, caller_script, sizeof(caller_script));
             }
-            if (caller.name)
-                strncpy(caller_func, caller.name, sizeof(caller_func)-1);
-            caller_line = caller.currentline;
         }
     }
 
-    char buf[LINE_LEN];
-    snprintf(buf, sizeof(buf), "%-35s | dipanggil dari: %s:%d (%s)",
-        ar->name ? ar->name : "?",
-        caller_src,
-        caller_line,
-        caller_func
-    );
-    addLine(buf);
+    // Skip kalau caller bukan user script
+    if (caller_script[0] == '\0') return;
+
+    pthread_mutex_lock(&g_mutex);
+    FuncEntry* e = getEntry(ar->name);
+    if (e) addScript(e, caller_script);
+    pthread_mutex_unlock(&g_mutex);
 }
 
 // ── GOT hook ─────────────────────────────────────────────────
@@ -148,9 +183,9 @@ lua_State* LuaDebugger_newstate_hook(void) {
 // ── Flush thread ─────────────────────────────────────────────
 static void* flushThread(void*) {
     while (true) {
-        sleep(3);
+        sleep(5);
         pthread_mutex_lock(&g_mutex);
-        flushBuf();
+        flushToFile();
         pthread_mutex_unlock(&g_mutex);
     }
     return NULL;
@@ -221,20 +256,13 @@ static bool patchGOT(uintptr_t base, const char* symName, void* newFunc) {
 __attribute__((constructor))
 static void onLoad() {
     LOGI("LuaDebugger loaded!");
-    writeLog("=== LuaDebugger Tracker START ===");
+    writeLog("=== LuaDebugger API Tracker START ===");
 
     static int initialized = 0;
     if (initialized) return;
     initialized = 1;
 
-    // Tulis header tracker
-    FILE* f = fopen("/sdcard/luadbg_tracker.log", "w");
-    if (f) {
-        fprintf(f, "=== Function Tracker ===\n");
-        fprintf(f, "%-35s | %s\n", "FUNGSI", "DIPANGGIL DARI");
-        fprintf(f, "%s\n", "----------------------------------------------------------------------");
-        fclose(f);
-    }
+    memset(g_entries, 0, sizeof(g_entries));
 
     void* monetHandle = dlopen("libmonetloader.so", RTLD_NOW | RTLD_GLOBAL);
     if (!monetHandle) { writeLog("[Step2] FAILED"); return; }
@@ -267,19 +295,12 @@ static void onLoad() {
 
     if (patchGOT(monetBase, "luaL_newstate", (void*)hookFn_thumb)) {
         writeLog("[GOT] Patch SUCCESS");
+        writeLog("[INFO] Output: /sdcard/luadbg_api_usage.log");
+        writeLog("[INFO] Format: fungsi : script1, script2, ...");
+        writeLog("[INFO] Deduplicated — tiap script dicatat 1x per fungsi");
 
         pthread_t tid;
         pthread_create(&tid, NULL, flushThread, NULL);
         pthread_detach(tid);
-
-        writeLog("[INFO] Output: /sdcard/luadbg_tracker.log");
-
-        // Log fungsi yang di-track
-        writeLog("[TRACKING]:");
-        for (int i = 0; TRACKED_FUNCS[i]; i++) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "  - %s", TRACKED_FUNCS[i]);
-            writeLog(buf);
-        }
     }
 }
